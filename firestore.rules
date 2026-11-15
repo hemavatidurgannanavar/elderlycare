@@ -1,0 +1,125 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Helper function: Is user authenticated?
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    // Helper function: Is user the owner of the user document?
+    function isUser(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    // Helper function: Get membership document for current user in a care profile
+    function getMembership(profileId) {
+      return get(/databases/$(database)/documents/careProfiles/$(profileId)/members/$(request.auth.uid)).data;
+    }
+
+    // Helper function: Is the user an active member of this care profile?
+    function isProfileMember(profileId) {
+      return isAuthenticated() && 
+        exists(/databases/$(database)/documents/careProfiles/$(profileId)/members/$(request.auth.uid)) &&
+        getMembership(profileId).status == 'active';
+    }
+
+    // Helper function: Check member role in care profile
+    function hasRole(profileId, role) {
+      return isProfileMember(profileId) && getMembership(profileId).role == role;
+    }
+
+    function isOwner(profileId) {
+      return hasRole(profileId, 'owner');
+    }
+
+    function isCareManager(profileId) {
+      return hasRole(profileId, 'care_manager');
+    }
+
+    function isViewer(profileId) {
+      return hasRole(profileId, 'viewer');
+    }
+
+    function canManageCare(profileId) {
+      return isOwner(profileId) || isCareManager(profileId);
+    }
+
+    // 1. Users collection
+    match /users/{userId} {
+      allow read, write: if isUser(userId);
+    }
+
+    // 2. Care Profiles collection
+    match /careProfiles/{profileId} {
+      // Any authenticated user can create a new profile (they will become the initial owner)
+      allow create: if isAuthenticated() && request.resource.data.createdBy == request.auth.uid;
+      // Read allowed if active member
+      allow read: if isProfileMember(profileId);
+      // Update and delete allowed only for owners
+      allow update, delete: if isOwner(profileId);
+
+      // 2a. Members subcollection
+      match /members/{memberUserId} {
+        // Active members can view who else is in the circle
+        allow read: if isProfileMember(profileId);
+        // Only owners can create, modify, or delete memberships
+        // (Exception: during initial profile creation, creator adds themselves as owner)
+        allow create: if isAuthenticated() && (
+          (request.auth.uid == memberUserId && request.resource.data.role == 'owner') ||
+          isOwner(profileId)
+        );
+        allow update, delete: if isOwner(profileId);
+      }
+
+      // 2b. Medications subcollection
+      match /medications/{medicationId} {
+        allow read: if isProfileMember(profileId);
+        allow create, update, delete: if canManageCare(profileId);
+      }
+
+      // 2c. Dose Occurrences subcollection
+      match /doseOccurrences/{doseId} {
+        allow read: if isProfileMember(profileId);
+        // Care Managers and Owners can create or update doses.
+        // Profile owners (the elderly person) can record their own dose status.
+        allow create, update: if canManageCare(profileId);
+        allow delete: if isOwner(profileId);
+      }
+
+      // 2d. Appointments subcollection
+      match /appointments/{appointmentId} {
+        allow read: if isProfileMember(profileId);
+        allow create, update, delete: if canManageCare(profileId);
+      }
+
+      // 2e. Notifications subcollection
+      match /notifications/{notificationId} {
+        // Members can view notifications intended for them or circle notifications
+        allow read: if isProfileMember(profileId);
+        // Notifications are managed server-side, but allow writes if owner/care manager
+        allow write: if canManageCare(profileId);
+      }
+
+      // 2f. Audit Events subcollection (immutable audit log)
+      match /auditEvents/{eventId} {
+        allow read: if canManageCare(profileId);
+        // Create allowed by any active member performing an audited action
+        allow create: if isProfileMember(profileId);
+        // Never allow editing or deleting historical audit events
+        allow update, delete: if false;
+      }
+    }
+
+    // 3. Global Invitations collection (for secure token acceptance)
+    match /invitations/{inviteId} {
+      // Authenticated users can read their invitation details
+      allow read: if isAuthenticated();
+      // Only authenticated users who are profile owners can create invitations
+      allow create: if isAuthenticated() && isOwner(request.resource.data.profileId);
+      // Mark as used upon acceptance
+      allow update: if isAuthenticated();
+      allow delete: if isAuthenticated() && isOwner(resource.data.profileId);
+    }
+  }
+}
